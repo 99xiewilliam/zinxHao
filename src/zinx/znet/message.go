@@ -35,3 +35,12 @@ func (m *Message) SetData(data []byte) {
 func (m *Message) SetDataLLen(len uint32) {
 	m.DataLen = len
 }
+
+//创建一个Msg消息包
+func NewMsgPackage(id uint32, data []byte) *Message {
+	return &Message{
+		Id:      id,
+		DataLen: uint32(len(data)),
+		Data:    data,
+	}
+}
