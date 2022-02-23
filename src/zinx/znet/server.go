@@ -18,8 +18,16 @@ type Server struct {
 	//服务器监听端口
 	Port int
 
-	//当前的Server添加一个router，server注册链接对应的处理业务
-	Router ziface.IRouter
+	//当前server的消息管理模块，用来绑定MsgID和对应的处理业务API关系
+	MsgHandler ziface.IMsgHandle
+
+	//该server的链接管理器
+	ConnMgr ziface.IConnManager
+
+	//该Server穿gain链接之后自动调用Hook函数--OnConnStart
+	OnConnStart func(conn ziface.IConnection)
+	//该Server销毁链接之前自动调用Hook函数--OnConnStop
+	OnConnStop func(conn ziface.IConnection)
 }
 
 //当前客户端链接的所绑定的handle api(目前这个handle是写死的，以后优化应该由用户自定义)
@@ -41,10 +49,11 @@ func (s *Server) Start() {
 		utils.GlobalObject.Version, utils.GlobalObject.MaxConn, utils.GlobalObject.MaxPackageSize)
 	fmt.Printf("{Start} Server listenner at IP :%s, Port %d is starting \n", s.IP, s.Port)
 	go func() {
+		s.MsgHandler.StartWorkerPool()
 		//1。获取tcp的Addr
 		addr, err := net.ResolveTCPAddr(s.IPVersion, fmt.Sprintf("%s:%d", s.IP, s.Port))
 		if err != nil {
-			fmt.Println("resolve tcp addt error: ", err)
+			fmt.Println("resolve tcp addr error: ", err)
 			return
 		}
 
@@ -64,9 +73,17 @@ func (s *Server) Start() {
 				fmt.Println("Accept err", err)
 				continue
 			}
+
+			if s.ConnMgr.Len() >= utils.GlobalObject.MaxConn {
+				// TODO给客户端相应一个超出最大的连接错误包
+				fmt.Println("====> Too many Connections MaxConn = ", utils.GlobalObject.MaxConn)
+				conn.Close()
+				continue
+			}
+
 			//已经与客户端建立连接，做一些业务，做一个最基本的最大512字节长度的回显业务
 			//将处理心链接的业务方法和conn进行绑定 得到我们的链接模块
-			dealConn := NewConnection(conn, cid, s.Router)
+			dealConn := NewConnection(s, conn, cid, s.MsgHandler)
 			cid++
 			go dealConn.Start()
 			//go func() {
@@ -90,6 +107,9 @@ func (s *Server) Start() {
 
 func (s *Server) Stop() {
 	//TODO 将一些服务器的资源，状态或者一些已经开始的链接信息 进行停止或者回收
+	fmt.Println("[STOP] Zinx server name", s.Name)
+	s.ConnMgr.ClearConn()
+
 }
 
 func (s *Server) Serve() {
@@ -101,20 +121,51 @@ func (s *Server) Serve() {
 	select {}
 }
 
-func (s *Server) AddRouter(router ziface.IRouter) {
-	s.Router = router
+func (s *Server) AddRouter(msgID uint32, router ziface.IRouter) {
+	s.MsgHandler.AddRouter(msgID, router)
 	fmt.Println("add Router succ!")
+}
+
+func (s *Server) GetConnMgr() ziface.IConnManager {
+	return s.ConnMgr
 }
 
 //初始化Server模块方法
 
 func NewServer(name string) ziface.IServer {
 	s := &Server{
-		Name:      utils.GlobalObject.Name,
-		IPVersion: "tcp4",
-		IP:        utils.GlobalObject.Host,
-		Port:      utils.GlobalObject.TcpPort,
-		Router:    nil,
+		Name:       utils.GlobalObject.Name,
+		IPVersion:  "tcp4",
+		IP:         utils.GlobalObject.Host,
+		Port:       utils.GlobalObject.TcpPort,
+		MsgHandler: NewMsghandle(),
+		ConnMgr:    NewConnManager(),
 	}
 	return s
+}
+
+//注册OnConnStart钩子函数
+func (s *Server) SetOnConnStart(hookFunc func(connection ziface.IConnection)) {
+	s.OnConnStart = hookFunc
+}
+
+//注册OnConnStop钩子函数
+func (s *Server) SetOnConnStop(hookFunc func(connection ziface.IConnection)) {
+	s.OnConnStop = hookFunc
+}
+
+//调用OnConnStart钩子函数
+func (s *Server) CallOnConnStart(conn ziface.IConnection) {
+	if s.OnConnStart != nil {
+		fmt.Println("----> Call OnConnStart()...")
+		s.OnConnStart(conn)
+	}
+}
+
+//调用OnConnStop钩子函数
+func (s *Server) CallOnConnStop(conn ziface.IConnection) {
+	if s.OnConnStop != nil {
+		fmt.Println("---> Call OnConnStop()")
+		s.OnConnStop(conn)
+	}
 }

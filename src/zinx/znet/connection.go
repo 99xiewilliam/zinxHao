@@ -3,12 +3,16 @@ package znet
 import (
 	"errors"
 	"fmt"
+	"go/src/zinx/utils"
 	"go/src/zinx/ziface"
 	"io"
 	"net"
+	"sync"
 )
 
 type Connection struct {
+	//当前Conn隶属于哪个Server
+	TcpServer ziface.IServer
 	//当前链接的socket TCP套接字
 	Conn *net.TCPConn
 
@@ -24,18 +28,33 @@ type Connection struct {
 	//告知当前链接已经推出的/停止 channel
 	ExitChan chan bool
 
-	//该链接处理方法Router
-	Router ziface.IRouter
+	//无缓冲的管道和对应的处理业务API关系
+	msgChan chan []byte
+
+	//消息的管理MsgID 和对应的处理业务API关系
+	MsgHandler ziface.IMsgHandle
+
+	//链接属性集合
+	property map[string]interface{}
+	//保护链接属性的锁
+	propertyLock sync.RWMutex
 }
 
-func NewConnection(conn *net.TCPConn, connID uint32, router ziface.IRouter) *Connection {
+func NewConnection(server ziface.IServer, conn *net.TCPConn, connID uint32, msgHandler ziface.IMsgHandle) *Connection {
 	c := &Connection{
-		Conn:     conn,
-		ConnID:   connID,
-		Router:   router,
-		isClosed: false,
-		ExitChan: make(chan bool, 1),
+		TcpServer:  server,
+		Conn:       conn,
+		ConnID:     connID,
+		MsgHandler: msgHandler,
+		isClosed:   false,
+		msgChan:    make(chan []byte),
+		ExitChan:   make(chan bool, 1),
+		property:   make(map[string]interface{}),
 	}
+
+	//将conn加入到ConnManager中
+	fmt.Println("123123")
+	c.TcpServer.GetConnMgr().Add(c)
 
 	return c
 }
@@ -43,7 +62,7 @@ func NewConnection(conn *net.TCPConn, connID uint32, router ziface.IRouter) *Con
 //链接的读业务方法
 func (c *Connection) StartReader() {
 	fmt.Println("Reader Goroutine is running...")
-	defer fmt.Println("connID=", c.ConnID, "Reader is exit, remote addr is ", c.RemoteAddr().String())
+	defer fmt.Println("connID=", c.ConnID, "[Reader is exit], remote addr is ", c.RemoteAddr().String())
 	defer c.Stop()
 
 	for {
@@ -90,12 +109,20 @@ func (c *Connection) StartReader() {
 			conn: c,
 			msg:  msg,
 		}
-		//执行注册路由方法
-		go func(request ziface.IRequest) {
-			c.Router.PreHandle(request)
-			c.Router.Handle(request)
-			c.Router.PostHandle(request)
-		}(&req)
+		////执行注册路由方法
+		//go func(request ziface.IRequest) {
+		//	c.Router.PreHandle(request)
+		//	c.Router.Handle(request)
+		//	c.Router.PostHandle(request)
+		//}(&req)
+		//根据绑定好的MsgID 找到对应处理的API业务 执行
+		if utils.GlobalObject.WorkerPoolSize > 0 {
+			//已经开启了工作池机制，将消息发送给Worker工作池处理即可
+			c.MsgHandler.SendMsgToTaskQueue(&req)
+		} else {
+			go c.MsgHandler.DoMsgHandler(&req)
+		}
+
 		//从路由中，找到注册绑定的Conn对应的router调用
 
 	}
@@ -117,11 +144,60 @@ func (c *Connection) SendMsg(msgId uint32, data []byte) error {
 		return errors.New("Pack error msg")
 	}
 
-	if _, err := c.Conn.Write(binaryMsg); err != nil {
-		fmt.Println("Write msg id", msgId, "error:", err)
-		return errors.New("conn Write error")
-	}
+	//if _, err := c.Conn.Write(binaryMsg); err != nil {
+	//	fmt.Println("Write msg id", msgId, "error:", err)
+	//	return errors.New("conn Write error")
+	//}
+
+	c.msgChan <- binaryMsg
 	return nil
+}
+
+//设置链接属性
+func (c *Connection) SetProperty(key string, value interface{}) {
+	c.propertyLock.Lock()
+	defer c.propertyLock.Unlock()
+
+	c.property[key] = value
+}
+
+//获取链接属性
+func (c *Connection) GetProperty(key string) (interface{}, error) {
+	c.propertyLock.RLock()
+	defer c.propertyLock.RUnlock()
+
+	if value, ok := c.property[key]; ok {
+		return value, nil
+	} else {
+		return nil, errors.New("no property found")
+	}
+}
+
+//移除链接属性
+func (c *Connection) RemoveProperty(key string) {
+	c.propertyLock.Lock()
+	defer c.propertyLock.Unlock()
+
+	delete(c.property, key)
+}
+
+//写消息的goroutine，专门发送给客户端消息的模块
+func (c *Connection) StartWriter() {
+	fmt.Println("[Writer Goroutine is running...]")
+	defer fmt.Println(c.RemoteAddr().String(), "[conn Writer exit!]")
+
+	for {
+		select {
+		case data := <-c.msgChan:
+			if _, err := c.Conn.Write(data); err != nil {
+				fmt.Println("send data error", err)
+				return
+			}
+		case <-c.ExitChan:
+			//Reader 已经推出，此时Writer也要退出
+			return
+		}
+	}
 }
 
 //启动链接 当前链接准备开始工作
@@ -129,6 +205,11 @@ func (c *Connection) Start() {
 	fmt.Println("Conn Start()... ConnID = ", c.ConnID)
 	//TODO 启动当前从链接写数据的业务
 	go c.StartReader()
+
+	go c.StartWriter()
+
+	//按照开发者传递进来的，创建链接之后需要调用的处理业务，执行对应Hook函数
+	c.TcpServer.CallOnConnStart(c)
 
 }
 
@@ -139,8 +220,18 @@ func (c *Connection) Stop() {
 		return
 	}
 	c.isClosed = true
+
+	//调用开发者注册的销毁链接之间 需要执行的Hook函数
+	c.TcpServer.CallOnConnStop(c)
+	//关闭socket链接
 	c.Conn.Close()
+	c.ExitChan <- true
+
+	//将当前链接从ConnMgr中摘除掉
+	c.TcpServer.GetConnMgr().Remove(c)
+
 	close(c.ExitChan)
+	close(c.msgChan)
 }
 
 //获取当前链接绑定的socket conn
